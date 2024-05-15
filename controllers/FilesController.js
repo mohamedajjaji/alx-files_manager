@@ -6,6 +6,8 @@ import { findUserIdByToken } from '../utils/findUserById';
 import dbClient from '../utils/db';
 import redisClient from '../utils/redis';
 
+const mime = require('mime-types');
+
 class FilesController {
   // Should create a new file in DB and in disk
   static async postUpload(request, response) {
@@ -206,6 +208,41 @@ class FilesController {
     const updatedFileDocument = await dbClient.db.collection('files').findOne({ _id: ObjectID(idFile) });
 
     return response.status(200).json(updatedFileDocument);
+  }
+
+  // GET /files/:id/data
+  static async getFile(request, response) {
+    const idFile = request.params.id;
+    if (!ObjectID.isValid(idFile)) return response.status(404).json({ error: 'Not found' });
+
+    const fileDocument = await dbClient.db.collection('files').findOne({ _id: ObjectID(idFile) });
+    if (!fileDocument) return response.status(404).json({ error: 'Not found' });
+
+    if (!fileDocument.isPublic) {
+      const token = request.headers['x-token'];
+      if (!token) return response.status(404).json({ error: 'Not found' });
+
+      const keyID = await redisClient.get(`auth_${token}`);
+      if (!keyID) return response.status(404).json({ error: 'Not found' });
+
+      const user = await dbClient.db.collection('users').findOne({ _id: ObjectID(keyID) });
+      if (!user || fileDocument.userId.toString() !== user._id.toString()) {
+        return response.status(404).json({ error: 'Not found' });
+      }
+    }
+
+    if (fileDocument.type === 'folder') {
+      return response.status(400).json({ error: "A folder doesn't have content" });
+    }
+
+    const { localPath } = fileDocument;
+    if (!fs.existsSync(localPath)) return response.status(404).json({ error: 'Not found' });
+
+    const mimeType = mime.lookup(fileDocument.name);
+    response.setHeader('Content-Type', mimeType);
+
+    const fileContent = fs.readFileSync(localPath, 'utf-8');
+    return response.send(fileContent);
   }
 }
 
