@@ -4,6 +4,7 @@ import { v4 as uuidv4 } from 'uuid';
 import Queue from 'bull';
 import { findUserIdByToken } from '../utils/findUserById';
 import dbClient from '../utils/db';
+import redisClient from '../utils/redis';
 
 class FilesController {
   // Should create a new file in DB and in disk
@@ -83,6 +84,68 @@ class FilesController {
     return response.status(201).json({
       id: fileInserted.ops[0]._id, userId, name, type, isPublic, parentId,
     });
+  }
+
+  // GET /files/:id
+  // Return file by fileId
+  static async getShow(request, response) {
+    // Retrieve the user based on the token
+    const token = request.headers['x-token'];
+    if (!token) return response.status(401).json({ error: 'Unauthorized' });
+
+    const keyID = await redisClient.get(`auth_${token}`);
+    if (!keyID) return response.status(401).json({ error: 'Unauthorized' });
+
+    const user = await dbClient.db.collection('users').findOne({ _id: ObjectID(keyID) });
+    if (!user) return response.status(401).json({ error: 'Unauthorized' });
+
+    const idFile = request.params.id;
+    if (!ObjectID.isValid(idFile)) return response.status(404).json({ error: 'Not found' });
+
+    const fileDocument = await dbClient.db.collection('files').findOne({
+      _id: ObjectID(idFile),
+      userId: user._id,
+    });
+    if (!fileDocument) return response.status(404).json({ error: 'Not found' });
+
+    return response.json(fileDocument);
+  }
+
+  // GET /files
+  // Return the files attached to the user
+  static async getIndex(request, response) {
+    // Retrieve the user based on the token
+    const token = request.headers['x-token'];
+    if (!token) return response.status(401).json({ error: 'Unauthorized' });
+
+    const keyID = await redisClient.get(`auth_${token}`);
+    if (!keyID) return response.status(401).json({ error: 'Unauthorized' });
+
+    const user = await dbClient.db.collection('users').findOne({ _id: ObjectID(keyID) });
+    if (!user) return response.status(401).json({ error: 'Unauthorized' });
+
+    const parentId = request.query.parentId || '0';
+    const page = parseInt(request.query.page, 10) || 0;
+
+    const query = { userId: user._id };
+    if (parentId !== '0') query.parentId = ObjectID(parentId);
+
+    const files = await dbClient.db.collection('files')
+      .find(query)
+      .skip(page * 20)
+      .limit(20)
+      .toArray();
+
+    const filesArray = files.map((file) => ({
+      id: file._id,
+      userId: file.userId,
+      name: file.name,
+      type: file.type,
+      isPublic: file.isPublic,
+      parentId: file.parentId,
+    }));
+
+    return response.json(filesArray);
   }
 }
 
