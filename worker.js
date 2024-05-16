@@ -1,42 +1,72 @@
-import Queue from 'bull';
+import { writeFile } from 'fs';
+import { promisify } from 'util';
+import Queue from 'bull/lib/queue';
+import imgThumbnail from 'image-thumbnail';
 import { ObjectID } from 'mongodb';
-import imageThumbnail from 'image-thumbnail';
-import fs from 'fs';
 import dbClient from './utils/db';
+import Mailer from './utils/mailer';
 
-const fileQueue = new Queue('fileQueue');
+const writeFileAsync = promisify(writeFile);
+const fileQueue = new Queue('thumbnail generation');
+const userQueue = new Queue('email sending');
+
+// Generates the thumbnail of an image with a given width size
+const generateThumbnail = async (filePath, size) => {
+  const buffer = await imgThumbnail(filePath, { width: size });
+  console.log(`Generating file: ${filePath}, size: ${size}`);
+  return writeFileAsync(`${filePath}_${size}`, buffer);
+};
 
 fileQueue.process(async (job, done) => {
-  const { userId, fileId, localPath } = job.data;
+  const fileId = job.data.fileId || null;
+  const userId = job.data.userId || null;
 
   if (!fileId) {
-    done(new Error('Missing fileId'));
-    return;
+    throw new Error('Missing fileId');
   }
+  if (!userId) {
+    throw new Error('Missing userId');
+  }
+  console.log('Processing', job.data.name || '');
+  const file = await (await dbClient.filesCollection())
+    .findOne({
+      _id: new ObjectID(fileId),
+      userId: new ObjectID(userId),
+    });
+  if (!file) {
+    throw new Error('File not found');
+  }
+  const sizes = [500, 250, 100];
+  Promise.all(sizes.map((size) => generateThumbnail(file.localPath, size)))
+    .then(() => {
+      done();
+    });
+});
+
+userQueue.process(async (job, done) => {
+  const userId = job.data.userId || null;
 
   if (!userId) {
-    done(new Error('Missing userId'));
-    return;
+    throw new Error('Missing userId');
   }
-
+  const user = await (await dbClient.usersCollection())
+    .findOne({ _id: new ObjectID(userId) });
+  if (!user) {
+    throw new Error('User not found');
+  }
+  console.log(`Welcome ${user.email}!`);
   try {
-    const fileDocument = await dbClient.db.collection('files').findOne({ _id: ObjectID(fileId), userId: ObjectID(userId) });
-    if (!fileDocument) {
-      done(new Error('File not found'));
-      return;
-    }
-
-    const sizes = [500, 250, 100];
-    const thumbnailPromises = sizes.map(async (size) => {
-      const thumbnail = await imageThumbnail(localPath, { width: size });
-      const thumbnailPath = `${localPath}_${size}`;
-      fs.writeFileSync(thumbnailPath, thumbnail);
-    });
-
-    await Promise.all(thumbnailPromises);
-
+    const mailSubject = 'Welcome to ALX-Files_Manager';
+    const mailContent = [
+      '<div>',
+      '<h3>Hello {{user.name}},</h3>',
+      'Welcome to ALX-Files_Manager',
+      'A simple file management API built with Node.js ',
+      '</div>',
+    ].join('');
+    Mailer.sendMail(Mailer.buildMessage(user.email, mailSubject, mailContent));
     done();
-  } catch (error) {
-    done(error);
+  } catch (err) {
+    done(err);
   }
 });
