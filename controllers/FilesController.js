@@ -8,36 +8,34 @@ import redisClient from '../utils/redis';
 
 const mime = require('mime-types');
 
+const fileQueue = new Queue('fileQueue');
+
 class FilesController {
   // Should create a new file in DB and in disk
   static async postUpload(request, response) {
-    const fileQueue = new Queue('fileQueue');
-    // Retrieve the user based on the token
+  // Retrieve the user based on the token
     const userId = await findUserIdByToken(request);
     if (!userId) return response.status(401).json({ error: 'Unauthorized' });
 
     let fileInserted;
 
     // Validate the request data
-    const { name } = request.body;
-    if (!name) return response.status(400).json({ error: 'Missing name' });
-    const { type } = request.body;
-    if (!type || !['folder', 'file', 'image'].includes(type)) { return response.status(400).json({ error: 'Missing type' }); }
+    const {
+      name, type, data, isPublic = false, parentId = 0,
+    } = request.body;
 
-    const isPublic = request.body.isPublic || false;
-    const parentId = request.body.parentId || 0;
-    const { data } = request.body;
-    if (!data && !['folder'].includes(type)) { return response.status(400).json({ error: 'Missing data' }); }
+    if (!name) return response.status(400).json({ error: 'Missing name' });
+    if (!type || !['folder', 'file', 'image'].includes(type)) {
+      return response.status(400).json({ error: 'Missing type' });
+    }
+    if (!data && type !== 'folder') return response.status(400).json({ error: 'Missing data' });
+
     // ParentId (optional) represents the ID of the parent (default 0-> root)
     if (parentId !== 0) {
-      const parentFileArray = await dbClient.files.find({ _id: ObjectID(parentId) }).toArray();
-      if (parentFileArray.length === 0) return response.status(400).json({ error: 'Parent not found' });
-      const file = parentFileArray[0];
-      if (file.type !== 'folder') return response.status(400).json({ error: 'Parent is not a folder' });
+      const parentFile = await dbClient.files.findOne({ _id: ObjectID(parentId) });
+      if (!parentFile) return response.status(400).json({ error: 'Parent not found' });
+      if (parentFile.type !== 'folder') return response.status(400).json({ error: 'Parent is not a folder' });
     }
-
-    // If there is no data and it is not a folder, return an error
-    if (!data && type !== 'folder') return response.status(400).json({ error: 'Missing Data' });
 
     // If the type is folder, then insert into the DB with the owner as ObjectID(userId)
     if (type === 'folder') {
@@ -48,22 +46,19 @@ class FilesController {
         isPublic,
         parentId: parentId === 0 ? parentId : ObjectID(parentId),
       });
-    // If it's not a folder, store the file in the DB unscrambled
+      // If it's not a folder, store the file in the DB unscrambled
     } else {
       // Create a folder for this file
       const folderPath = process.env.FOLDER_PATH || '/tmp/files_manager';
-      if (!fs.existsSync(folderPath)) fs.mkdirSync(folderPath, { recursive: true }, () => {});
+      if (!fs.existsSync(folderPath)) fs.mkdirSync(folderPath, { recursive: true });
 
       // Create an ID and a new path to the new file
       const filenameUUID = uuidv4();
       const localPath = `${folderPath}/${filenameUUID}`;
+      const clearData = Buffer.from(data, 'base64');
 
       // Unscramble data and write to new path
-      const clearData = Buffer.from(data, 'base64');
       await fs.promises.writeFile(localPath, clearData.toString(), { flag: 'w+' });
-      await fs.readdirSync('/').forEach((file) => {
-        console.log(file);
-      });
 
       // Insert into the DB
       fileInserted = await dbClient.files.insertOne({
@@ -77,11 +72,9 @@ class FilesController {
 
       // If the file is an image, save it as binary data
       if (type === 'image') {
-        await fs.promises.writeFile(localPath, clearData, { flag: 'w+', encoding: 'binary' });
         await fileQueue.add({ userId, fileId: fileInserted.insertedId, localPath });
       }
     }
-
     // Return the new file with a status code 201
     return response.status(201).json({
       id: fileInserted.ops[0]._id, userId, name, type, isPublic, parentId,
@@ -213,6 +206,8 @@ class FilesController {
   // GET /files/:id/data
   static async getFile(request, response) {
     const idFile = request.params.id;
+    const { size } = request.query;
+
     if (!ObjectID.isValid(idFile)) return response.status(404).json({ error: 'Not found' });
 
     const fileDocument = await dbClient.db.collection('files').findOne({ _id: ObjectID(idFile) });
@@ -235,13 +230,17 @@ class FilesController {
       return response.status(400).json({ error: "A folder doesn't have content" });
     }
 
-    const { localPath } = fileDocument;
-    if (!fs.existsSync(localPath)) return response.status(404).json({ error: 'Not found' });
+    let filePath = fileDocument.localPath;
+    if (size && [100, 250, 500].includes(parseInt(size, 10))) {
+      filePath = `${filePath}_${size}`;
+    }
+
+    if (!fs.existsSync(filePath)) return response.status(404).json({ error: 'Not found' });
 
     const mimeType = mime.lookup(fileDocument.name);
     response.setHeader('Content-Type', mimeType);
 
-    const fileContent = fs.readFileSync(localPath, 'utf-8');
+    const fileContent = fs.readFileSync(filePath, 'utf-8');
     return response.send(fileContent);
   }
 }
